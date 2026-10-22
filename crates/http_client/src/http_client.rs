@@ -1,21 +1,20 @@
 mod async_body;
 #[cfg(not(target_family = "wasm"))]
 pub mod github;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "github-download"))]
 pub mod github_download;
 
 pub use anyhow::{Result, anyhow};
 pub use async_body::{AsyncBody, Inner, Json};
-use derive_more::Deref;
 pub use http::{self, Method, Request, Response, StatusCode, Uri, request::Builder};
 use http::{HeaderName, HeaderValue};
 
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::{any::type_name, fmt};
+use std::{ops::Deref, sync::Arc, time::Duration};
 pub use url::{Host, Url};
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
@@ -26,6 +25,9 @@ pub enum RedirectPolicy {
     FollowAll,
 }
 pub struct FollowRedirects(pub bool);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTimeout(pub Duration);
 
 pub trait HttpRequestExt {
     /// Conditionally modify self with the given closure.
@@ -49,11 +51,19 @@ pub trait HttpRequestExt {
 
     /// Whether or not to follow redirects
     fn follow_redirects(self, follow: RedirectPolicy) -> Self;
+
+    /// Sets a deadline for the complete HTTP request, including its response body.
+    fn timeout(self, timeout: Duration) -> Self;
 }
 
 impl HttpRequestExt for http::request::Builder {
     fn follow_redirects(self, follow: RedirectPolicy) -> Self {
         self.extension(follow)
+    }
+
+    fn timeout(self, timeout: Duration) -> Self {
+        debug_assert!(!timeout.is_zero(), "timeout must be positive");
+        self.extension(RequestTimeout(timeout))
     }
 }
 
@@ -114,6 +124,10 @@ pub trait HttpClient: 'static + Send + Sync {
 
     fn proxy(&self) -> Option<&Url>;
 
+    fn no_proxy(&self) -> Option<&str> {
+        None
+    }
+
     fn send(
         &self,
         req: http::Request<AsyncBody>,
@@ -164,9 +178,7 @@ pub trait HttpClient: 'static + Send + Sync {
 }
 
 /// An [`HttpClient`] that may have a proxy.
-#[derive(Deref)]
 pub struct HttpClientWithProxy {
-    #[deref]
     client: Arc<dyn HttpClient>,
     proxy: Option<Url>,
 }
@@ -188,6 +200,15 @@ impl HttpClientWithProxy {
     }
 }
 
+impl Deref for HttpClientWithProxy {
+    type Target = Arc<dyn HttpClient>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
 impl HttpClient for HttpClientWithProxy {
     fn send(
         &self,
@@ -204,6 +225,10 @@ impl HttpClient for HttpClientWithProxy {
         self.proxy.as_ref()
     }
 
+    fn no_proxy(&self) -> Option<&str> {
+        self.client.no_proxy()
+    }
+
     #[cfg(feature = "test-support")]
     fn as_fake(&self) -> &FakeHttpClient {
         self.client.as_fake()
@@ -211,10 +236,8 @@ impl HttpClient for HttpClientWithProxy {
 }
 
 /// An [`HttpClient`] that has a base URL.
-#[derive(Deref)]
 pub struct HttpClientWithUrl {
     base_url: Mutex<String>,
-    #[deref]
     client: HttpClientWithProxy,
 }
 
@@ -321,6 +344,15 @@ impl HttpClientWithUrl {
     }
 }
 
+impl Deref for HttpClientWithUrl {
+    type Target = HttpClientWithProxy;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
 impl HttpClient for HttpClientWithUrl {
     fn send(
         &self,
@@ -335,6 +367,10 @@ impl HttpClient for HttpClientWithUrl {
 
     fn proxy(&self) -> Option<&Url> {
         self.client.proxy.as_ref()
+    }
+
+    fn no_proxy(&self) -> Option<&str> {
+        self.client.no_proxy()
     }
 
     #[cfg(feature = "test-support")]

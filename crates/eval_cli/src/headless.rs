@@ -5,7 +5,6 @@ use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore};
 use db::AppDatabase;
 use extension::ExtensionHostProxy;
 use fs::RealFs;
-use gpui::http_client::read_proxy_from_env;
 use gpui::{App, AppContext as _, Entity};
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
@@ -48,14 +47,12 @@ pub fn init(cx: &mut App) -> Arc<AgentCliAppState> {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    let proxy_str = ProxySettings::get_global(cx).proxy.to_owned();
-    let proxy_url = proxy_str
-        .as_ref()
-        .and_then(|input| input.parse().ok())
-        .or_else(read_proxy_from_env);
+    let proxy_settings = ProxySettings::get_global(cx);
+    let proxy_url = proxy_settings.proxy_url();
+    let no_proxy = proxy_settings.no_proxy();
     let http = {
         let _guard = Tokio::handle(cx).enter();
-        ReqwestClient::proxy_and_user_agent(proxy_url, &user_agent)
+        ReqwestClient::proxy_and_user_agent(proxy_url, no_proxy, &user_agent)
             .expect("could not start HTTP client")
     };
     cx.set_http_client(Arc::new(http));
@@ -67,10 +64,7 @@ pub fn init(cx: &mut App) -> Arc<AgentCliAppState> {
     cx.set_global(app_db);
 
     let git_binary_path = None;
-    let fs = Arc::new(RealFs::new(
-        git_binary_path,
-        cx.background_executor().clone(),
-    ));
+    let fs = RealFs::new(git_binary_path, cx.background_executor().clone());
     <dyn fs::Fs>::set_global(fs.clone(), cx);
 
     let mut languages = LanguageRegistry::new(cx.background_executor().clone());
@@ -116,6 +110,11 @@ pub fn init(cx: &mut App) -> Arc<AgentCliAppState> {
     languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
     prompt_store::init(cx);
     terminal_view::init(cx);
+
+    // The eval CLI runs headless with no controlling TTY, so PTY allocation and
+    // acquiring a controlling terminal fail with `ENOTTY`. Tell the agent to run
+    // its terminal commands without a PTY (and non-interactively) instead.
+    cx.set_global(acp_thread::HeadlessTerminal(true));
 
     let stdout_is_a_pty = false;
     let prompt_builder = PromptBuilder::load(fs.clone(), stdout_is_a_pty, cx);
